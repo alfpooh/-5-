@@ -15,6 +15,7 @@ What it does
 Usage
   python3 dvd_backup.py                 # copy VIDEO_TS to ~/Movies/<disc name>
   python3 dvd_backup.py --mkv           # ...and also build <disc name>.mkv
+  python3 dvd_backup.py --mp4           # ONE compressed .mp4 with all audio languages
   python3 dvd_backup.py --dest ~/Desktop --mkv --eject
 
 Only standard-library Python is used. ffmpeg is needed only for --mkv
@@ -26,8 +27,8 @@ will not play back.
 """
 
 import argparse
-import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -223,7 +224,7 @@ ISO639 = {
 }
 
 
-# ------------------------------------------------------------ MKV remuxing ---
+# ----------------------------------------------------- one-file conversion ---
 
 def main_title_vobs(video_ts):
     """Pick the title set with the most video (the main feature) and return
@@ -246,36 +247,37 @@ def main_title_vobs(video_ts):
     return ifo, [os.path.join(video_ts, n) for n in vobs], set_size(best)
 
 
-def probe_streams(first_vob):
+STREAM_RE = re.compile(r"Stream #0:\d+\[0x([0-9a-fA-F]+)\]: (Video|Audio|Subtitle)")
+
+
+def probe_streams(ffmpeg, first_vob):
+    """List (stream_id, 'video'|'audio'|'subtitle') using `ffmpeg -i`."""
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-analyzeduration", "200M", "-probesize", "200M",
-         "-show_streams", "-of", "json", first_vob],
+        [ffmpeg, "-hide_banner", "-analyzeduration", "200M", "-probesize", "200M",
+         "-f", "mpeg", "-i", first_vob],
         capture_output=True, text=True)
-    try:
-        return json.loads(out.stdout).get("streams", [])
-    except json.JSONDecodeError:
-        return []
+    return [(int(m.group(1), 16), m.group(2).lower())
+            for m in STREAM_RE.finditer(out.stderr)]
 
 
-def make_mkv(video_ts, out_path):
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        print("\nffmpeg not found — skipping MKV. Install it with: brew install ffmpeg")
+def make_movie(video_ts, out_path, fmt, fast=False):
+    """Turn the main feature into ONE file with every audio language.
+    fmt='mp4': compressed H.264 + AAC (plays in QuickTime), subtitles dropped.
+    fmt='mkv': lossless copy of video/audio/subtitles (VLC / IINA)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("\nffmpeg not found. Install it with: brew install ffmpeg")
         return False
 
     ifo, vobs, total = main_title_vobs(video_ts)
     if not vobs:
-        print("\nNo title VOBs found — skipping MKV.")
+        print("\nNo title VOBs found on the disc.")
         return False
     audio_langs, sub_langs = read_title_langs(ifo)
 
-    streams = probe_streams(vobs[0])
     maps, meta = [], []
     out_a = out_s = 0
-    for s in streams:
-        sid = int(s.get("id", "0"), 16) if isinstance(s.get("id"), str) else None
-        ctype = s.get("codec_type")
-        if sid is None:
-            continue
+    for sid, ctype in probe_streams(ffmpeg, vobs[0]):
         if ctype == "video":
             maps.append(f"0:i:{hex(sid)}")
         elif ctype == "audio":
@@ -284,45 +286,64 @@ def make_mkv(video_ts, out_path):
             if l:
                 meta += [f"-metadata:s:a:{out_a}", f"language={ISO639.get(l, l)}"]
             out_a += 1
-        elif ctype == "subtitle":
+        elif ctype == "subtitle" and fmt == "mkv":
             maps.append(f"0:i:{hex(sid)}")
             l = sub_langs.get(sid & 0x1F)
             if l:
                 meta += [f"-metadata:s:s:{out_s}", f"language={ISO639.get(l, l)}"]
             out_s += 1
-    if not maps:  # probe failed: fall back to "everything"
-        maps = ["0:v?", "0:a?", "0:s?"]
+    if not maps:  # probe failed: take all video + audio
+        maps = ["0:v?", "0:a?"] + (["0:s?"] if fmt == "mkv" else [])
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
            "-fflags", "+genpts", "-analyzeduration", "200M", "-probesize", "200M",
            "-f", "mpeg", "-i", "pipe:0"]
     for m in maps:
         cmd += ["-map", m]
-    cmd += ["-c", "copy"] + meta + [out_path]
+    if fmt == "mp4":
+        if fast and sys.platform == "darwin":
+            video = ["-c:v", "h264_videotoolbox", "-b:v", "4M"]  # Mac hardware encoder
+        else:
+            video = ["-c:v", "libx264", "-crf", "20", "-preset", "medium"]
+        cmd += video + ["-vf", "yadif=deint=interlaced", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "320k",
+                        "-disposition:a", "0", "-disposition:a:0", "default",
+                        "-movflags", "+faststart"]
+    else:
+        cmd += ["-c", "copy"]
+    cmd += meta + [out_path]
 
-    print(f"\nMain feature: {len(vobs)} VOB file(s), "
-          f"{out_a} audio track(s), {out_s} subtitle track(s)")
+    print(f"\nMain feature: {len(vobs)} VOB file(s), {out_a} audio track(s)"
+          + (f", {out_s} subtitle track(s)" if fmt == "mkv" else ""))
     if audio_langs:
         print("Audio languages: " + ", ".join(audio_langs[k] for k in sorted(audio_langs)))
 
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    progress = Progress(total, f"Building MKV -> {out_path}")
+    verb = "Compressing to MP4" if fmt == "mp4" else "Building MKV"
+    progress = Progress(total, f"{verb} -> {out_path}")
+    bad_total = 0
     try:
         for vob in vobs:
-            with open(vob, "rb") as f:
-                while True:
-                    data = f.read(CHUNK)
+            size = os.path.getsize(vob)
+            with open(vob, "rb", buffering=0) as f:
+                offset = 0
+                while offset < size:
+                    data, bad = read_chunk(f, offset, min(CHUNK, size - offset))
                     if not data:
                         break
                     proc.stdin.write(data)
+                    offset += len(data)
+                    bad_total += bad
                     progress.update(len(data), os.path.basename(vob))
         proc.stdin.close()
     except BrokenPipeError:
         pass
     rc = proc.wait()
     progress.finish()
+    if bad_total:
+        print(f"Warning: {bad_total} unreadable sector(s) were skipped.")
     if rc != 0:
-        print(f"ffmpeg exited with code {rc}; the MKV may be incomplete.")
+        print(f"ffmpeg exited with code {rc}; the file may be incomplete.")
         return False
     return True
 
@@ -335,8 +356,13 @@ def main():
     ap.add_argument("--dest", default=os.path.expanduser("~/Movies"),
                     help="folder to save into (default: ~/Movies)")
     ap.add_argument("--name", help="backup name (default: disc volume name)")
+    ap.add_argument("--mp4", action="store_true",
+                    help="save ONE compressed .mp4 (H.264 + all audio languages) instead of "
+                         "copying the disc folder (needs ffmpeg)")
+    ap.add_argument("--fast", action="store_true",
+                    help="with --mp4: use the Mac's hardware encoder (much faster, bigger file)")
     ap.add_argument("--mkv", action="store_true",
-                    help="also make one .mkv of the main feature with all audio tracks (needs ffmpeg)")
+                    help="also make one lossless .mkv of the main feature (needs ffmpeg)")
     ap.add_argument("--eject", action="store_true", help="eject the disc when done")
     args = ap.parse_args()
 
@@ -346,34 +372,46 @@ def main():
                  "or pass --source /Volumes/<DISC>.")
 
     name = args.name or os.path.basename(os.path.normpath(source)) or "DVD"
-    dest_dir = os.path.join(os.path.expanduser(args.dest), name)
-    files = list_disc_files(source)
-    total = sum(size for _, size in files)
-
-    os.makedirs(dest_dir, exist_ok=True)
-    need = total * (2 if args.mkv else 1)
-    free = shutil.disk_usage(dest_dir).free
-    if free < need:
-        sys.exit(f"Not enough free space: need {fmt_bytes(need)}, have {fmt_bytes(free)}.")
-
+    dest_root = os.path.expanduser(args.dest)
+    os.makedirs(dest_root, exist_ok=True)
     print(f"Disc:        {source}")
-    print(f"Destination: {dest_dir}")
-    print(f"Files:       {len(files)}  ({fmt_bytes(total)})")
 
-    made_mkv = False
     try:
-        copy_disc(source, dest_dir, files)
-        if args.mkv:
-            made_mkv = make_mkv(os.path.join(dest_dir, "VIDEO_TS"), os.path.join(dest_dir, f"{name}.mkv"))
+        if args.mp4:
+            # Encode straight from the disc into a single file.
+            out_path = os.path.join(dest_root, f"{name}.mp4")
+            _, _, title_size = main_title_vobs(os.path.join(source, "VIDEO_TS"))
+            free = shutil.disk_usage(dest_root).free
+            if free < title_size:
+                sys.exit(f"Not enough free space: need up to {fmt_bytes(title_size)}, "
+                         f"have {fmt_bytes(free)}.")
+            print(f"Output:      {out_path}")
+            ok = make_movie(os.path.join(source, "VIDEO_TS"), out_path, "mp4", args.fast)
+            result = (f"\nSaved: {out_path}\nPlay it: double-click (QuickTime). "
+                      "Switch language via View > Languages (or Audio menu in VLC/IINA)."
+                      if ok else "\nMP4 was not created.")
+        else:
+            dest_dir = os.path.join(dest_root, name)
+            files = list_disc_files(source)
+            total = sum(size for _, size in files)
+            os.makedirs(dest_dir, exist_ok=True)
+            need = total * (2 if args.mkv else 1)
+            free = shutil.disk_usage(dest_dir).free
+            if free < need:
+                sys.exit(f"Not enough free space: need {fmt_bytes(need)}, have {fmt_bytes(free)}.")
+            print(f"Destination: {dest_dir}")
+            print(f"Files:       {len(files)}  ({fmt_bytes(total)})")
+            copy_disc(source, dest_dir, files)
+            made_mkv = args.mkv and make_movie(os.path.join(dest_dir, "VIDEO_TS"),
+                                               os.path.join(dest_dir, f"{name}.mkv"), "mkv")
+            result = (f"\nBackup saved to: {dest_dir}\nPlay it: open the VIDEO_TS folder in VLC or IINA"
+                      + (", or open the .mkv file." if made_mkv else "."))
     except KeyboardInterrupt:
         sys.exit("\nCancelled.")
 
     if args.eject and sys.platform == "darwin":
         subprocess.run(["drutil", "eject"], check=False)
-
-    print(f"\nBackup saved to: {dest_dir}")
-    print("Play it: open the VIDEO_TS folder in VLC or IINA"
-          + (", or open the .mkv file." if made_mkv else "."))
+    print(result)
 
 
 if __name__ == "__main__":
